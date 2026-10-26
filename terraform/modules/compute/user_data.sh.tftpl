@@ -1,0 +1,50 @@
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee -a /var/log/app-bootstrap.log) 2>&1
+
+dnf install -y ${node_package} tar gzip
+
+id app >/dev/null 2>&1 || useradd --system --home-dir /opt/app --shell /sbin/nologin app
+mkdir -p /opt/app
+
+# Fetch the release artifact built by CI (retry while networking settles).
+for i in $(seq 1 10); do
+  aws s3 cp s3://${release_bucket}/releases/${app_version}.tar.gz /tmp/app.tar.gz --region ${region} && break
+  sleep 10
+done
+tar -xzf /tmp/app.tar.gz -C /opt/app
+
+# RDS CA bundle so the app verifies the TLS certificate of the database.
+curl -fsSL -o /opt/app/rds-global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+chown -R app:app /opt/app
+
+cat > /etc/systemd/system/app.service <<'UNIT'
+[Unit]
+Description=DevOps task Node.js app (${color})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=app
+WorkingDirectory=/opt/app
+ExecStart=/usr/bin/node /opt/app/server.js
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=${app_port}
+Environment=AWS_REGION=${region}
+Environment=DB_SECRET_ID=${db_secret_arn}
+Environment=DB_SSL_CA=/opt/app/rds-global-bundle.pem
+Environment=S3_BUCKET=${app_bucket}
+Environment=APP_COLOR=${color}
+Environment=APP_VERSION=${app_version}
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now app.service
