@@ -1,0 +1,13 @@
+output "app_url" { value = "https://${var.domain_name}" }
+output "alb_dns_name" { value = module.alb.dns_name }
+output "active_color" { value = var.active_color }
+output "blue_version" { value = var.blue_version }
+output "green_version" { value = var.green_version }
+output "blue_enabled" { value = var.blue_enabled }
+output "green_enabled" { value = var.green_enabled }
+output "target_group_arns" { value = module.alb.target_group_arns }
+output "db_secret_arn" { value = module.database.secret_arn }
+output "rds_primary_endpoint" { value = module.database.primary_endpoint }
+output "rds_replica_endpoint" { value = module.database.replica_endpoint }
+output "app_bucket" { value = module.storage.app_bucket_id }
+output "alb_logs_bucket" { value = module.storage.alb_logs_bucket_id }

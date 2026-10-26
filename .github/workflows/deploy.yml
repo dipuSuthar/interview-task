@@ -1,0 +1,150 @@
+name: Deploy AWS Infrastructure
+
+on:
+  push:
+    branches: [main, "deploy/**"]
+    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: What to do
+        type: choice
+        options: [deploy, rollback, destroy]
+        default: deploy
+      keep_standby:
+        description: Keep the old fleet running after cut-over
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # OIDC to AWS
+  contents: read
+
+concurrency:
+  group: terraform-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_release_bucket: ${{ vars.RELEASE_BUCKET }}
+  TF_DIR: terraform/environments/${{ inputs.environment || 'dev' }}
+
+jobs:
+  test-app:
+    name: Test Node.js app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: app
+        run: |
+          npm install
+          npm test
+
+  terraform-validate:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+      - run: terraform fmt -check -recursive terraform
+      - name: Validate environments
+        run: |
+          for env in dev prod; do
+            terraform -chdir=terraform/environments/$env init -backend=false -input=false
+            terraform -chdir=terraform/environments/$env validate
+          done
+      - name: Security scan (tfsec-style, non-blocking)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          exit-code: "0"
+          severity: HIGH,CRITICAL
+
+  plan:
+    name: Terraform plan (pull requests)
+    if: github.event_name == 'pull_request'
+    needs: [test-app, terraform-validate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+          terraform_wrapper: false
+      - run: |
+          terraform -chdir=$TF_DIR init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=dev/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir=$TF_DIR plan -input=false -lock-timeout=5m \
+            -var "blue_version=${{ github.sha }}" -var "green_version=${{ github.sha }}"
+
+  release:
+    name: Build, deploy (blue/green) & verify
+    if: github.event_name != 'pull_request'
+    needs: [test-app, terraform-validate]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}   # add required reviewers in repo settings for prod
+    env:
+      ACTION: ${{ inputs.action || 'deploy' }}
+      KEEP_STANDBY: ${{ inputs.keep_standby || 'false' }}
+      APP_VERSION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+          terraform_wrapper: false
+
+      - name: Build and upload release artifact
+        if: env.ACTION == 'deploy'
+        run: |
+          ./scripts/package-app.sh "$APP_VERSION"
+          aws s3 cp "dist/${APP_VERSION}.tar.gz" "s3://${{ vars.RELEASE_BUCKET }}/releases/${APP_VERSION}.tar.gz"
+
+      - name: Terraform init
+        run: |
+          terraform -chdir=$TF_DIR init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ inputs.environment || 'dev' }}/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+
+      - name: Blue/green ${{ env.ACTION }}
+        run: ./scripts/bluegreen.sh
+
+      - name: Summary
+        if: env.ACTION != 'destroy'
+        run: |
+          {
+            echo "### Deployment complete"
+            echo "- URL: $(terraform -chdir=$TF_DIR output -raw app_url)"
+            echo "- Active colour: $(terraform -chdir=$TF_DIR output -raw active_color)"
+            echo "- Version: \`$APP_VERSION\`"
+          } >> "$GITHUB_STEP_SUMMARY"
